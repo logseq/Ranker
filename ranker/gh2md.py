@@ -15,6 +15,7 @@ import requests
 from dateutil.parser import parse as dateutil_parse
 
 import templates_markdown
+import strategy
 
 ENV_GITHUB_TOKEN = "GITHUB_ACCESS_TOKEN"
 GITHUB_ACCESS_TOKEN_PATHS = [
@@ -669,9 +670,10 @@ def export_issues_to_markdown_file(
     Given a GithubRepo type contained already-fetched data, convert it to markdown.
     """
     formatted_issues = {}
+    ir_scores = {}
     for issue in repo.issues:
         try:
-            slug, formatted_issue = format_issue_to_markdown(issue)
+            slug, formatted_issue, ir_score = format_issue_to_markdown(issue)
         except Exception:
             logger.info(
                 "Couldn't process issue due to exceptions, skipping", exc_info=True
@@ -679,6 +681,7 @@ def export_issues_to_markdown_file(
             continue
         else:
             formatted_issues[slug] = formatted_issue
+            ir_scores[slug] = ir_score
 
     if len(formatted_issues.keys()) == 0:
         if use_multiple_files:
@@ -709,11 +712,19 @@ def export_issues_to_markdown_file(
             with open(issue_path, "wb") as out:
                 out.write(issue_file_markdown.encode("utf-8"))
     else:
+        # formatted_issues.values()
+        # Now sort the issues by issue_scores, from highest to lowest
+        sorted_issues_keys = sorted(
+            formatted_issues.keys(),
+            key=lambda x: ir_scores[x],
+            reverse=True,
+        )
+        sorted_issues = [formatted_issues[k] for k in sorted_issues_keys]
         # Write everything in one file
         full_markdown_export = templates_markdown.BASE.format(
             repo_name=repo.full_name,
             repo_url=repo.url,
-            issues="\n".join(formatted_issues.values()),
+            issues="\n".join(sorted_issues),
             datestring=datestring,
         )
         logger.info("Writing to file: {}".format(output_path))
@@ -746,18 +757,7 @@ def format_issue_to_markdown(issue: GithubIssue) -> Tuple[str, str]:
 
         formatted_comments += "\n\n".join(comments)
 
-    # Calculate the issue rank score with the algorithm:
-    # (<num-of-comments> * 2 + <num-of-emoji>) * <last-response-decay>
-    # where last-response-decay is 10 if the last response was within 30 days,
-    # linearly decaying to 1 if the last response was 360 days ago.
-    num_of_comments = len(issue.comments)
-    # TODO: Implement emoji parsing
-    num_of_emoji = 0
-    # TODO: Implement last response decay
-    last_response_decay =  10
-    ir_score = (num_of_comments * 2 + num_of_emoji) * last_response_decay
-    # Comment string for logging how the score was calculated
-    ir_comment = "comment number: {}".format(num_of_comments)
+    ir_score, ir_comment = strategy.issue_rank_score(issue)
 
     number = str(issue.number)
     if issue.pull_request:
@@ -795,7 +795,7 @@ def format_issue_to_markdown(issue: GithubIssue) -> Tuple[str, str]:
             issue.state,
         ]
     )
-    return slug, formatted_issue.replace("\r", "")
+    return slug, formatted_issue.replace("\r", ""), ir_score
 
 
 def get_environment_token() -> str:
