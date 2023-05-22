@@ -15,7 +15,7 @@ import requests
 from dateutil.parser import parse as dateutil_parse
 
 import templates_markdown
-import strategy
+import configurations
 
 ENV_GITHUB_TOKEN = "GITHUB_ACCESS_TOKEN"
 GITHUB_ACCESS_TOKEN_PATHS = [
@@ -46,6 +46,14 @@ logformat = "[%(asctime)s] [%(levelname)s] %(msg)s"
 logging.basicConfig(level=logging.INFO, format=logformat)
 logger = logging.getLogger(__name__)
 
+@dataclass
+class GithubReaction:
+    """
+    Represents a reaction on an issue or PR.
+    """
+
+    user_login: str
+    content: str
 
 @dataclass
 class GithubComment:
@@ -53,10 +61,12 @@ class GithubComment:
     Represents a comment on an issue or PR.
     """
 
+    reactions: List[GithubReaction]
     user_login: str
     user_url: str
     user_avatar_url: str
     created_at: datetime.datetime
+    last_edited_at: datetime.datetime # edit time, or create time if not edited
     url: str
     body: str
 
@@ -69,6 +79,7 @@ class GithubIssue:
     this code to use GraphQL. It might make sense to separate out later.
     """
 
+    reactions: List[GithubReaction]
     user_login: str
     user_url: str
     user_avatar_url: str
@@ -80,6 +91,7 @@ class GithubIssue:
     label_names: List[str]
     title: str
     created_at: datetime.datetime
+    last_edited_at: datetime.datetime # edit time, or create time if not edited
     url: str
 
 
@@ -211,6 +223,7 @@ class GithubAPI:
                 body
                 state
                 createdAt
+                lastEditedAt
                 author {
                   login
                   url
@@ -231,6 +244,7 @@ class GithubAPI:
                   nodes {
                     body
                     createdAt
+                    lastEditedAt
                     url
                     author {
                       login
@@ -315,14 +329,6 @@ class GithubAPI:
                   createdAt
                   lastEditedAt
                   url
-                  reactions(first: 50) {
-                    edges {
-                      node {
-                        content
-                        user
-                      }
-                    }
-                  }
                   author {
                     login
                     url
@@ -346,6 +352,128 @@ class GithubAPI:
                     login
                     url
                     avatarUrl
+                  }
+                }
+              }
+            }
+          }
+        }
+    """
+
+    _REACTIONS_QUERY = """
+        query(
+          $owner: String!
+          $repo: String!
+          $issuePerPage: Int!
+          $issueNextPageCursor: String
+          $pullRequestPerPage: Int!
+          $pullRequestNextPageCursor: String
+          $issueStates: [IssueState!]
+          $pullRequestStates: [PullRequestState!]
+        ) {
+          rateLimit {
+            limit
+            cost
+            remaining
+            resetAt
+          }
+          repository(owner: $owner, name: $repo) {
+            nameWithOwner
+            url
+            issues(
+              first: $issuePerPage
+              after: $issueNextPageCursor
+              filterBy: { states: $issueStates }
+              orderBy: { field: CREATED_AT, direction: DESC }
+            ) {
+              totalCount
+              pageInfo {
+                endCursor
+                hasNextPage
+              }
+              nodes {
+                id
+                reactions(first: 20){
+                  nodes{
+                    user {
+                      login
+                    }
+                    content
+                  }
+                }
+                comments(last: 1) {
+                  totalCount
+                  pageInfo {
+                    endCursor
+                    hasNextPage
+                  }
+                  nodes {
+                    body
+                    createdAt
+                    lastEditedAt
+                    url
+                    reactions(first: 20) {
+                      nodes {
+                        content
+                        user {
+                          login
+                        }
+                      }
+                    }
+                    author {
+                      login
+                      url
+                      avatarUrl
+                    }
+                  }
+                }
+              }
+            }
+            pullRequests(
+              first: $pullRequestPerPage
+              after: $pullRequestNextPageCursor
+              states: $pullRequestStates
+              orderBy: { field: CREATED_AT, direction: DESC }
+            ) {
+              totalCount
+              pageInfo {
+                endCursor
+                hasNextPage
+              }
+              nodes {
+                id
+                number
+                url
+                title
+                body
+                state
+                createdAt
+                author {
+                  login
+                  url
+                  avatarUrl
+                }
+                labels(first: $pullRequestPerPage) {
+                  nodes {
+                    name
+                    url
+                  }
+                }
+                comments(first: $pullRequestPerPage) {
+                  totalCount
+                  pageInfo {
+                    endCursor
+                    hasNextPage
+                  }
+                  nodes {
+                    body
+                    createdAt
+                    url
+                    author {
+                      login
+                      url
+                      avatarUrl
+                    }
                   }
                 }
               }
@@ -468,9 +596,17 @@ class GithubAPI:
                 data, err = self._post(
                     json={"query": self._REPO_QUERY, "variables": variables}
                 )
-                if err:
+                data2, err2 = self._post(
+                    json={"query": self._REACTIONS_QUERY, "variables": variables}
+                )
+                if err or err2:
                     break
                 else:
+                    # merge data1 and data2
+                    for node, node2 in zip(data["data"]["repository"]["issues"]["nodes"], data2["data"]["repository"]["issues"]["nodes"]):
+                        if len(node2['comments']['nodes']) and 'reactions' in node2['comments']['nodes'][-1]:
+                            node['comments']['nodes'][-1]['reactions'] = node2['comments']['nodes'][-1]['reactions']
+                    
                     success_responses.append(data)
 
                     issues = data["data"]["repository"]["issues"]
@@ -494,6 +630,8 @@ class GithubAPI:
                 logger.warning("Interrupted, will convert retrieved data and exit")
                 was_interrupted = True
                 break
+
+        # TODO Junyi: merge reactions into success_responses
 
         # Merge all the pages (including comments) into one big response object
         # by extending the list of nodes in the first page. This makes it easier
@@ -622,12 +760,37 @@ class GithubAPI:
         self, issue_or_pr: Dict[str, Any], is_pull_request: bool
     ) -> GithubIssue:
         i = issue_or_pr
+        root_reactions = []
+        if ("reactions" in i and i["reactions"]):
+            for r in i["reactions"]["nodes"]:
+                try:
+                    root_reactions.append(
+                        GithubReaction(
+                            content=r["content"],
+                            user_login=r["user"]["login"],
+                        )
+                    )
+                except Exception:
+                    logger.warning(f"Error parsing reaction, skipping: {r}", exc_info=True)
         comments = []
         for c in i["comments"]["nodes"]:
+            reactions = []
+            if ("reactions" in c and c["reactions"]):
+                for r in c["reactions"]["nodes"]:
+                    try:
+                        reactions.append(
+                            GithubReaction(
+                                content=r["content"],
+                                user_login=r["user"]["login"],
+                            )
+                        )
+                    except Exception:
+                        logger.warning(f"Error parsing reaction, skipping: {r}", exc_info=True)
             try:
                 comments.append(
                     GithubComment(
                         created_at=dateutil_parse(c["createdAt"]),
+                        last_edited_at=(dateutil_parse(c["lastEditedAt"]) if ("lastEditedAt" in c and c["lastEditedAt"]) else dateutil_parse(c["createdAt"])),
                         body=c["body"],
                         user_login=c["author"]["login"]
                         if c.get("author")
@@ -637,6 +800,7 @@ class GithubAPI:
                         if c.get("author")
                         else "(unknown)",
                         url=c["url"],
+                        reactions=reactions,
                     )
                 )
             except Exception:
@@ -653,9 +817,11 @@ class GithubAPI:
             number=i["number"],
             title=i["title"],
             created_at=dateutil_parse(i["createdAt"]),
+            last_edited_at=(dateutil_parse(i["lastEditedAt"]) if ("lastEditedAt" in i and i["lastEditedAt"]) else dateutil_parse(i["createdAt"])),
             url=i["url"],
             label_names=[node["name"] for node in i["labels"]["nodes"]],
             comments=comments,
+            reactions=root_reactions,
         )
 
 
@@ -733,6 +899,37 @@ def export_issues_to_markdown_file(
     return None
 
 # def issue_rank_scorer
+def issue_rank_score(issue: GithubIssue):
+    """
+        Calculate the issue rank score with the algorithm:\n
+        (<num-of-comments> * 2 + <num-of-emoji>) * <last-response-decay>\n
+        where last-response-decay is 10 if the last response was within 30 days,\n
+        linearly decaying to 1 if the last response was 360 days ago.  
+    """
+    # Number of comments since the last exluded user's comment
+    num_of_new_comments = 0
+    for c in issue.comments:
+        if c.user_login in configurations.user_exclude:
+            num_of_new_comments = 0
+        else:
+            num_of_new_comments += 1
+
+    num_of_emoji = len(issue.reactions)
+    # TODO: Implement last response decay
+    last_response_decay =  10
+    ir_score = (num_of_new_comments * 2 + num_of_emoji) * last_response_decay
+    # Comment string for logging how the score was calculated
+    ir_comment = "\# of new comment: {}".format(num_of_new_comments)
+
+    # If exluded users have reacted to the issue, then lower the score
+    if len(issue.comments) > 0:
+        for r in issue.comments[-1].reactions:
+            if r.user_login in configurations.user_exclude:
+                ir_score *= 0.1
+                ir_comment += ", reacted by: {}".format(r.user_login)
+                break
+
+    return ir_score, ir_comment
 
 def format_issue_to_markdown(issue: GithubIssue) -> Tuple[str, str]:
     """
@@ -757,7 +954,7 @@ def format_issue_to_markdown(issue: GithubIssue) -> Tuple[str, str]:
 
         formatted_comments += "\n\n".join(comments)
 
-    ir_score, ir_comment = strategy.issue_rank_score(issue)
+    ir_score, ir_comment = issue_rank_score(issue)
 
     number = str(issue.number)
     if issue.pull_request:
